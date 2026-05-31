@@ -14,6 +14,7 @@ mac-everything (CLI引擎)  →  mac-everything-gui (HTTP服务 :8765)  →  浏
 可直接在右边releases下载mac-everything.dmg，或复制以下地址
 (https://github.com/user-attachments/files/28434642/mac-everything.dmg.zip)
 
+```bash
 # 1. 拷贝脚本
 cp mac-everything mac-everything-gui ~/.local/bin/
 chmod +x ~/.local/bin/mac-everything*
