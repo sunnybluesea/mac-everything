@@ -1,0 +1,637 @@
+#!/usr/bin/env python3.11
+"""
+mac-everything-gui — Everything-like desktop search for macOS
+Single binary: starts HTTP server, opens browser, serves search UI.
+"""
+import os
+import sys
+import json
+import time
+import threading
+import webbrowser
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+
+# ── Search Engine ──────────────────────────────────────────────
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from importlib.machinery import SourceFileLoader
+me_module = SourceFileLoader("mac_everything", os.path.join(os.path.dirname(os.path.abspath(__file__)), "mac-everything")).load_module()
+
+engine = None
+engine_lock = threading.Lock()
+
+def get_engine():
+    global engine
+    with engine_lock:
+        if engine is None:
+            engine = me_module.MacEverything()
+            # Warm up: quick sync on startup
+            while True:
+                now=time.time()
+                try:
+                    engine.quick_sync()
+                except NameError:
+                    break
+                break
+        return engine
+
+# ── HTML UI ────────────────────────────────────────────────────
+HTML = r"""<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>mac-everything</title>
+<style>
+:root {
+  --bg: #1a1a2e;
+  --surface: #16213e;
+  --border: #0f3460;
+  --text: #e0e0e0;
+  --text-dim: #8892b0;
+  --accent: #64ffda;
+  --accent-dim: #0f3460;
+  --row-hover: #1a2744;
+  --row-even: #121a2f;
+  --scrollbar: #0f3460;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Mono', 'Menlo', monospace;
+  background: var(--bg);
+  color: var(--text);
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  -webkit-app-region: drag;
+}
+
+/* ── Title Bar ── */
+.titlebar {
+  display: flex;
+  align-items: center;
+  padding: 8px 16px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  gap: 10px;
+  -webkit-app-region: drag;
+}
+.titlebar-icon { font-size: 18px; }
+.titlebar-text { font-size: 12px; color: var(--text-dim); font-weight: 500; }
+.titlebar-count { font-size: 11px; color: var(--accent); margin-left: auto; }
+
+/* ── Search Bar ── */
+.search-wrap {
+  padding: 12px 16px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  -webkit-app-region: no-drag;
+}
+.search-box {
+  display: flex;
+  align-items: center;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 12px;
+  transition: border-color 0.15s;
+}
+.search-box:focus-within { border-color: var(--accent); }
+.search-icon { color: var(--text-dim); margin-right: 8px; font-size: 14px; }
+#search {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font-size: 14px;
+  font-family: inherit;
+  padding: 4px 0;
+}
+#search::placeholder { color: var(--text-dim); }
+.search-shortcut {
+  color: var(--text-dim);
+  font-size: 11px;
+  background: var(--surface);
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+}
+
+/* ── Filters ── */
+.filters {
+  display: flex;
+  gap: 6px;
+  padding: 4px 0 0;
+  font-size: 11px;
+}
+.filter {
+  padding: 2px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid transparent;
+  transition: all 0.15s;
+  -webkit-app-region: no-drag;
+}
+.filter:hover { background: var(--border); color: var(--text); }
+.filter.active { background: var(--accent-dim); color: var(--accent); border-color: var(--accent); }
+
+/* ── Results Table ── */
+.results-wrap {
+  flex: 1;
+  overflow-y: auto;
+  -webkit-app-region: no-drag;
+}
+.results-wrap::-webkit-scrollbar { width: 8px; }
+.results-wrap::-webkit-scrollbar-track { background: var(--bg); }
+.results-wrap::-webkit-scrollbar-thumb { background: var(--scrollbar); border-radius: 4px; }
+
+#results { width: 100%; border-collapse: collapse; table-layout: fixed; }
+#results th {
+  position: sticky;
+  top: 0;
+  background: var(--surface);
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 500;
+  text-align: left;
+  padding: 6px 16px;
+  border-bottom: 1px solid var(--border);
+  z-index: 1;
+}
+#results td {
+  padding: 5px 16px;
+  font-size: 13px;
+  border-bottom: 1px solid rgba(15, 52, 96, 0.3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#results tr { cursor: pointer; transition: background 0.1s; }
+#results tr:nth-child(even) { background: var(--row-even); }
+#results tr:hover { background: var(--row-hover); }
+#results tr.selected { background: var(--accent-dim); }
+.col-icon { width: 28px; text-align: center; padding-right: 4px !important; }
+.col-name { width: 35%; }
+.col-path { width: 42%; color: var(--text-dim); }
+.col-size { width: 10%; text-align: right; }
+.col-date { width: 13%; text-align: right; color: var(--text-dim); }
+
+/* ── Status Bar ── */
+.statusbar {
+  display: flex;
+  align-items: center;
+  padding: 4px 16px;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--text-dim);
+  gap: 16px;
+  -webkit-app-region: drag;
+}
+.status-time { color: var(--accent); }
+
+/* ── Empty State ── */
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--text-dim);
+  font-size: 13px;
+  gap: 8px;
+}
+.empty-icon { font-size: 40px; opacity: 0.3; }
+</style>
+</head>
+<body>
+
+<!-- Title Bar -->
+<div class="titlebar">
+  <span class="titlebar-icon">🔍</span>
+  <span class="titlebar-text">mac-everything</span>
+  <span class="titlebar-count" id="count"></span>
+</div>
+
+<!-- Search -->
+<div class="search-wrap">
+  <div class="search-box">
+    <span class="search-icon">⌕</span>
+    <input id="search" type="text" placeholder="输入文件名搜索 (支持 * ? 通配符)..." autofocus>
+    <span class="search-shortcut">⌘K</span>
+  </div>
+  <div class="filters">
+    <span class="filter active" data-type="all">全部</span>
+    <span class="filter" data-type="doc">文档</span>
+    <span class="filter" data-type="img">图片</span>
+    <span class="filter" data-type="code">代码</span>
+    <span class="filter" data-type="dir">文件夹</span>
+  </div>
+</div>
+
+<!-- Results -->
+<div class="results-wrap" id="results-wrap">
+  <table id="results">
+    <thead>
+      <tr>
+        <th class="col-icon"></th>
+        <th class="col-name">名称</th>
+        <th class="col-path">路径</th>
+        <th class="col-size">大小</th>
+        <th class="col-date">修改时间</th>
+      </tr>
+    </thead>
+    <tbody id="results-body"></tbody>
+  </table>
+  <div class="empty" id="empty-state">
+    <span class="empty-icon">🔍</span>
+    <span>输入关键词开始搜索</span>
+    <span style="font-size:11px;opacity:0.5">支持 * ? 通配符，例如 *.pdf, report*</span>
+  </div>
+</div>
+
+<!-- Status Bar -->
+<div class="statusbar" id="statusbar">
+  <span id="status-text">就绪</span>
+  <span class="status-time" id="status-time"></span>
+</div>
+
+<script>
+// ── State ──
+let selectedIdx = -1;
+let currentResults = [];
+let currentFilter = 'all';
+
+const searchEl = document.getElementById('search');
+const tbody = document.getElementById('results-body');
+const countEl = document.getElementById('count');
+const emptyEl = document.getElementById('empty-state');
+const statusText = document.getElementById('status-text');
+const statusTime = document.getElementById('status-time');
+
+const DOC_EXTS = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'md', 'csv', 'pages', 'numbers', 'key'];
+const IMG_EXTS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'heic', 'ico', 'psd', 'ai'];
+const CODE_EXTS = ['py', 'js', 'ts', 'jsx', 'tsx', 'html', 'css', 'json', 'yaml', 'yml', 'toml', 'sh', 'bash', 'zsh', 'rs', 'go', 'java', 'c', 'cpp', 'h', 'rb', 'php', 'swift', 'kt', 'sql', 'r', 'lua'];
+
+function getIcon(name, ext, isDir) {
+  if (isDir) return '📁';
+  if (!ext) return '📄';
+  ext = ext.replace('.', '').toLowerCase();
+  if (IMG_EXTS.includes(ext)) return '🖼️';
+  if (CODE_EXTS.includes(ext)) return '💻';
+  if (DOC_EXTS.includes(ext)) return '📝';
+  if (ext === 'pdf') return '📕';
+  if (['mp3', 'wav', 'flac', 'aac', 'm4a'].includes(ext)) return '🎵';
+  if (['mp4', 'mov', 'avi', 'mkv', 'webm'].includes(ext)) return '🎬';
+  if (['zip', 'tar', 'gz', '7z', 'rar'].includes(ext)) return '📦';
+  if (['app', 'dmg', 'pkg'].includes(ext)) return '💿';
+  return '📄';
+}
+
+function fmtSize(bytes) {
+  if (!bytes || bytes === 0) return '';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0;
+  let s = bytes;
+  while (s >= 1024 && i < units.length - 1) { s /= 1024; i++; }
+  return s.toFixed(1) + ' ' + units[i];
+}
+
+function fmtDate(ts) {
+  if (!ts || ts === 0) return '';
+  const d = new Date(ts * 1000);
+  const pad = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+async function search(q) {
+  if (!q.trim()) {
+    tbody.innerHTML = '';
+    countEl.textContent = '';
+    emptyEl.style.display = 'flex';
+    currentResults = [];
+    selectedIdx = -1;
+    return;
+  }
+
+  statusText.textContent = '搜索中...';
+  const t0 = performance.now();
+
+  try {
+    const ext = currentFilter === 'all' ? '' : '';
+    const dirOnly = currentFilter === 'dir';
+    let url = `/api/search?q=${encodeURIComponent(q)}&limit=200`;
+    if (dirOnly) url += '&dir=1';
+
+    const resp = await fetch(url);
+    const data = await resp.json();
+
+    const elapsed = (performance.now() - t0).toFixed(1);
+    currentResults = data.results || [];
+    selectedIdx = -1;
+
+    // Filter by type client-side for speed
+    let filtered = currentResults;
+    if (currentFilter === 'doc') filtered = currentResults.filter(r => DOC_EXTS.includes((r[2]||'').replace('.','').toLowerCase()));
+    else if (currentFilter === 'img') filtered = currentResults.filter(r => IMG_EXTS.includes((r[2]||'').replace('.','').toLowerCase()));
+    else if (currentFilter === 'code') filtered = currentResults.filter(r => CODE_EXTS.includes((r[2]||'').replace('.','').toLowerCase()));
+    else if (currentFilter === 'dir') filtered = currentResults.filter(r => r[5] === 1);
+
+    renderResults(filtered, elapsed);
+    statusTime.textContent = elapsed + 'ms';
+  } catch (e) {
+    statusText.textContent = '错误: ' + e.message;
+  }
+}
+
+function renderResults(results, ms) {
+  tbody.innerHTML = '';
+
+  if (results.length === 0) {
+    emptyEl.style.display = 'flex';
+    emptyEl.innerHTML = '<span class="empty-icon">😕</span><span>未找到匹配文件</span>';
+    countEl.textContent = '';
+    statusText.textContent = '无结果';
+    return;
+  }
+
+  emptyEl.style.display = 'none';
+  countEl.textContent = results.length + ' 个文件';
+  statusText.textContent = '就绪';
+
+  for (let i = 0; i < results.length; i++) {
+    const [path, name, ext, size, mtime, isDir, rank] = results[i];
+    const tr = document.createElement('tr');
+    tr.dataset.index = i;
+    tr.dataset.path = path;
+    tr.innerHTML = `
+      <td class="col-icon">${getIcon(name, ext, isDir)}</td>
+      <td class="col-name" title="${name}">${name}</td>
+      <td class="col-path" title="${path}">${path}</td>
+      <td class="col-size">${fmtSize(size)}</td>
+      <td class="col-date">${fmtDate(mtime)}</td>
+    `;
+    tr.addEventListener('click', () => openFile(path, false));
+    tr.addEventListener('dblclick', () => openFile(path, false));
+    tr.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      openFile(path, true);  // right-click → reveal in Finder
+    });
+    tbody.appendChild(tr);
+  }
+
+  updateSelection();
+}
+
+function openFile(path, reveal) {
+  statusText.textContent = reveal ? '定位中...' : '打开中...';
+  let url = '/api/open?path=' + encodeURIComponent(path);
+  if (reveal) url += '&reveal=1';
+  fetch(url)
+    .then(r => r.json())
+    .then(d => {
+      if (d.ok) {
+        statusText.textContent = (reveal ? '📁 已在 Finder 中定位: ' : '✅ 已打开: ') + path.split('/').pop();
+      } else {
+        statusText.textContent = '❌ 打开失败: ' + (d.error || '未知错误');
+      }
+    })
+    .catch(e => {
+      statusText.textContent = '❌ 请求失败: ' + e.message;
+    });
+}
+
+function updateSelection() {
+  document.querySelectorAll('#results-body tr').forEach((tr, i) => {
+    tr.classList.toggle('selected', i === selectedIdx);
+  });
+}
+
+// ── Debounced Search ──
+let debounceTimer;
+searchEl.addEventListener('input', () => {
+  clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(() => search(searchEl.value), 80);
+});
+
+// ── Keyboard ──
+document.addEventListener('keydown', e => {
+  // ⌘K / ⌘L — focus search
+  if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'l')) {
+    e.preventDefault();
+    searchEl.focus();
+    searchEl.select();
+    return;
+  }
+
+  // ⌘F — focus search
+  if ((e.metaKey || e.ctrlKey) && e.key === 'f') {
+    e.preventDefault();
+    searchEl.focus();
+    searchEl.select();
+    return;
+  }
+
+  if (e.key === 'Escape') {
+    if (document.activeElement === searchEl) {
+      searchEl.blur();
+      searchEl.value = '';
+      search('');
+    }
+    return;
+  }
+
+  // Arrow keys — navigate results
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    if (selectedIdx < currentResults.length - 1) selectedIdx++;
+    updateSelection();
+    scrollToSelected();
+    return;
+  }
+  if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    if (selectedIdx > 0) selectedIdx--;
+    else if (selectedIdx === -1 && currentResults.length > 0) selectedIdx = 0;
+    updateSelection();
+    scrollToSelected();
+    return;
+  }
+
+  // Enter — open selected
+  if (e.key === 'Enter' && selectedIdx >= 0 && currentResults[selectedIdx]) {
+    e.preventDefault();
+    const reveal = e.metaKey || e.ctrlKey;  // ⌘+Enter → reveal in Finder
+    openFile(currentResults[selectedIdx][0], reveal);
+    return;
+  }
+});
+
+function scrollToSelected() {
+  const tr = document.querySelector(`#results-body tr[data-index="${selectedIdx}"]`);
+  if (tr) tr.scrollIntoView({ block: 'nearest' });
+}
+
+// ── Filters ──
+document.querySelectorAll('.filter').forEach(f => {
+  f.addEventListener('click', () => {
+    document.querySelectorAll('.filter').forEach(ff => ff.classList.remove('active'));
+    f.classList.add('active');
+    currentFilter = f.dataset.type;
+    search(searchEl.value);
+  });
+});
+
+// ── Init ──
+searchEl.focus();
+statusText.textContent = '⏳ 连接服务器中...';
+
+// Poll until server is ready (may take a few seconds on first launch)
+let pollCount = 0;
+function checkReady() {
+  fetch('/api/stats')
+    .then(r => r.json())
+    .then(d => {
+      statusText.textContent = `就绪 · ${d.files.toLocaleString()} 个文件已索引`;
+      searchEl.focus();
+    })
+    .catch(() => {
+      pollCount++;
+      if (pollCount < 60) setTimeout(checkReady, 500);
+      else statusText.textContent = '⚠️ 服务器未响应，请重试';
+    });
+}
+checkReady();
+</script>
+</body>
+</html>"""
+
+# ── HTTP Handler ───────────────────────────────────────────────
+class SearchHandler(SimpleHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass  # silent
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+
+        # API: search
+        if parsed.path == '/api/search':
+            params = parse_qs(parsed.query)
+            q = params.get('q', [''])[0]
+            limit = int(params.get('limit', ['200'])[0])
+            dir_only = 'dir' in params
+
+            try:
+                eng = get_engine()
+                rows, ms = eng.search(q, limit=limit, dir_only=dir_only)
+                results = [list(r) for r in rows]
+                resp = json.dumps({'results': results, 'ms': ms, 'query': q}, ensure_ascii=False).encode()
+            except Exception as e:
+                resp = json.dumps({'error': str(e), 'results': []}).encode()
+
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', len(resp))
+            self.end_headers()
+            self.wfile.write(resp)
+            return
+
+        # API: open file
+        if parsed.path == '/api/open':
+            import subprocess
+            params = parse_qs(parsed.query)
+            path = params.get('path', [''])[0]
+            reveal = 'reveal' in params
+            try:
+                cmd = ['open', '-R', path] if reveal else ['open', path]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                ok = result.returncode == 0
+                resp = json.dumps({'ok': ok, 'error': result.stderr.strip() if not ok else None}, ensure_ascii=False).encode()
+            except Exception as e:
+                resp = json.dumps({'ok': False, 'error': str(e)}, ensure_ascii=False).encode()
+
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', len(resp))
+            self.end_headers()
+            self.wfile.write(resp)
+            return
+
+        # API: stats
+        if parsed.path == '/api/stats':
+            eng = get_engine()
+            count, db_size = eng.stats()
+            me_module.format_size(db_size)
+            resp = json.dumps({
+                'files': count,
+                'db_size': db_size,
+                'db_size_human': me_module.format_size(db_size),
+                'last_indexed': eng.last_indexed,
+            }).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', len(resp))
+            self.end_headers()
+            self.wfile.write(resp)
+            return
+
+        # Favicon
+        if parsed.path == '/favicon.ico':
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        # Serve the main HTML page for everything else
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        resp = HTML.encode()
+        self.send_header('Content-Length', len(resp))
+        self.end_headers()
+        self.wfile.write(resp)
+
+
+# ── Main ───────────────────────────────────────────────────────
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="mac-everything GUI")
+    parser.add_argument("-p", "--port", type=int, default=8765, help="HTTP port (default: 8765)")
+    parser.add_argument("--no-browser", action="store_true", help="Don't open browser")
+    args = parser.parse_args()
+
+    # Pre-init engine (lightweight, just loads the DB)
+    print("🔍 Initializing search engine...")
+    eng = get_engine()
+    count, db_size = eng.stats()
+    print(f"   Index: {count:,} files, {me_module.format_size(db_size)}")
+
+    # Try to start server; if port taken, just open browser to existing instance
+    try:
+        server = HTTPServer(('127.0.0.1', args.port), SearchHandler)
+    except OSError:
+        # Already running — open browser to existing instance and stay alive
+        print(f"   Already running on port {args.port}, opening browser...")
+        if not args.no_browser:
+            webbrowser.open(f'http://127.0.0.1:{args.port}')
+        # Stay alive so macOS doesn't think the app crashed
+        import signal
+        signal.pause()
+        return
+
+    print(f"\n🚀 mac-everything GUI running at http://127.0.0.1:{args.port}")
+    print(f"   Press Ctrl+C to stop\n")
+
+    if not args.no_browser:
+        webbrowser.open(f'http://127.0.0.1:{args.port}')
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n👋 Shutting down...")
+        server.shutdown()
+
+if __name__ == '__main__':
+    main()

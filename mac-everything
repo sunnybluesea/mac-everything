@@ -1,0 +1,403 @@
+#!/usr/bin/env python3.11
+"""
+mac-everything — Instant file search for macOS
+Inspired by voidtools Everything for Windows.
+
+Indexes filesystem into SQLite FTS5 for sub-millisecond filename search.
+"""
+import os, sys, sqlite3, time, argparse, threading
+from pathlib import Path
+from datetime import datetime
+
+DB_PATH = os.path.expanduser("~/.mac-everything/index.db")
+IGNORE_PATTERNS = ['/System/Volumes/', '/.Trash/', '/.Spotlight-V100/', '/.fseventsd/',
+                   '/private/var/db/', '/Library/Caches/', '/Library/Logs/',
+                   'node_modules', '__pycache__', '.git/objects']
+
+class MacEverything:
+    def __init__(self, db_path=DB_PATH):
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA cache_size=-64000")  # 64MB cache
+        self._init_db()
+        self._lock = threading.Lock()
+
+    def _init_db(self):
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                ext TEXT,
+                size INTEGER DEFAULT 0,
+                mtime REAL DEFAULT 0,
+                is_dir INTEGER DEFAULT 0
+            )
+        """)
+        # FTS5 for instant text search
+        self.conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+                name, path, content='files', content_rowid='id'
+            )
+        """)
+        # Triggers to keep FTS in sync
+        self.conn.executescript("""
+            CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON files BEGIN
+                INSERT INTO files_fts(rowid, name, path) VALUES (new.id, new.name, new.path);
+            END;
+            CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON files BEGIN
+                INSERT INTO files_fts(files_fts, rowid, name, path) VALUES('delete', old.id, old.name, old.path);
+            END;
+            CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE ON files BEGIN
+                INSERT INTO files_fts(files_fts, rowid, name, path) VALUES('delete', old.id, old.name, old.path);
+                INSERT INTO files_fts(rowid, name, path) VALUES (new.id, new.name, new.path);
+            END;
+        """)
+        # Meta table for tracking index state
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)
+        """)
+        self.conn.execute("""
+            INSERT OR IGNORE INTO meta(key, value) VALUES ('last_indexed', '0')
+        """)
+        self.conn.commit()
+
+    @property
+    def last_indexed(self):
+        row = self.conn.execute("SELECT value FROM meta WHERE key='last_indexed'").fetchone()
+        return float(row[0]) if row else 0
+
+    @last_indexed.setter
+    def last_indexed(self, ts):
+        self.conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('last_indexed', ?)", (str(ts),))
+        self.conn.commit()
+
+    def quick_sync(self, scan_paths=None):
+        """Incremental update — only index files changed since last run."""
+        if scan_paths is None:
+            scan_paths = ["/Users"]
+        
+        cutoff = self.last_indexed
+        if cutoff == 0:
+            # Never indexed, do nothing (user should run 'index' first)
+            return 0, 0
+        
+        now = time.time()
+        added, removed = 0, 0
+        t0 = time.time()
+        
+        with self._lock:
+            # 1. Quick stale check: only verify paths likely deleted (mtime older than 7 days)
+            stale_cutoff = now - 604800  # 7 days
+            stale = self.conn.execute(
+                "SELECT path FROM files WHERE mtime < ? LIMIT 10000", (stale_cutoff,)
+            ).fetchall()
+            for (path,) in stale:
+                # Only check paths under our scan paths
+                if not any(path.startswith(sp) for sp in scan_paths):
+                    continue
+                if not os.path.exists(path):
+                    self.conn.execute("DELETE FROM files WHERE path = ?", (path,))
+                    removed += 1
+            if removed:
+                self.conn.commit()
+            
+            # 2. Find and index new/changed files via os.scandir (fast, no stat per file)
+            for root_path in scan_paths:
+                dirs_skipped = 0
+                for dirpath, dirnames, filenames in os.walk(root_path, followlinks=False):
+                    if self.should_ignore(dirpath):
+                        dirnames[:] = []
+                        continue
+                    dirnames[:] = [d for d in dirnames if not self.should_ignore(os.path.join(dirpath, d))]
+                    
+                    # Check if this directory's mtime indicates changes
+                    try:
+                        dir_mtime = os.lstat(dirpath).st_mtime
+                    except OSError:
+                        continue
+                    
+                    # Skip directories unchanged since last index (limit to avoid walking entire tree)
+                    if dir_mtime < cutoff and dirs_skipped < 500000:
+                        dirs_skipped += 1
+                        continue
+                    
+                    # Index changed directory fully
+                    for d in dirnames:
+                        full = os.path.join(dirpath, d)
+                        try:
+                            st = os.lstat(full)
+                            if st.st_mtime > cutoff:
+                                self.conn.execute(
+                                    "INSERT OR REPLACE INTO files(path, name, ext, size, mtime, is_dir) VALUES(?,?,?,?,?,?)",
+                                    (full, d, '', 0, st.st_mtime, 1))
+                                added += 1
+                        except OSError:
+                            continue
+                    
+                    for f in filenames:
+                        full = os.path.join(dirpath, f)
+                        try:
+                            st = os.lstat(full)
+                            if st.st_mtime > cutoff:
+                                _, ext = os.path.splitext(f)
+                                self.conn.execute(
+                                    "INSERT OR REPLACE INTO files(path, name, ext, size, mtime, is_dir) VALUES(?,?,?,?,?,?)",
+                                    (full, f, ext.lower(), st.st_size, st.st_mtime, 0))
+                                added += 1
+                        except OSError:
+                            continue
+                    
+                    if (added + removed) % 500 == 0 and (added + removed) > 0:
+                        self.conn.commit()
+            
+            self.conn.commit()
+            self.last_indexed = now
+        
+        elapsed = time.time() - t0
+        if added or removed:
+            print(f"  🔄 Synced: +{added} -{removed} files in {elapsed:.1f}s", flush=True)
+        return added, removed
+
+    def should_ignore(self, path):
+        for p in IGNORE_PATTERNS:
+            if p in path:
+                return True
+        return False
+
+    def index_path(self, scan_paths=None):
+        """Full index of filesystem."""
+        if scan_paths is None:
+            scan_paths = ["/Users"]
+        
+        with self._lock:
+            self.conn.execute("DELETE FROM files")
+            files_batch = []
+            count = 0
+            t0 = time.time()
+            
+            for root_path in scan_paths:
+                for dirpath, dirnames, filenames in os.walk(root_path, followlinks=False):
+                    if self.should_ignore(dirpath):
+                        dirnames[:] = []  # don't descend
+                        continue
+                    # Filter ignored dirs
+                    dirnames[:] = [d for d in dirnames if not self.should_ignore(os.path.join(dirpath, d))]
+                    
+                    # Add directories
+                    for d in dirnames:
+                        full = os.path.join(dirpath, d)
+                        try:
+                            st = os.lstat(full)
+                        except OSError:
+                            continue
+                        files_batch.append((full, d, '', st.st_size if not os.path.isdir(full) else 0, 
+                                          st.st_mtime, 1))
+                    
+                    # Add files
+                    for f in filenames:
+                        full = os.path.join(dirpath, f)
+                        try:
+                            st = os.lstat(full)
+                        except OSError:
+                            continue
+                        _, ext = os.path.splitext(f)
+                        files_batch.append((full, f, ext.lower(), st.st_size, st.st_mtime, 0))
+                    
+                    count += len(dirnames) + len(filenames)
+                    
+                    # Batch insert every 10000 files
+                    if len(files_batch) >= 10000:
+                        self.conn.executemany(
+                            "INSERT OR REPLACE INTO files(path, name, ext, size, mtime, is_dir) VALUES(?,?,?,?,?,?)",
+                            files_batch
+                        )
+                        self.conn.commit()
+                        elapsed = time.time() - t0
+                        rate = count / elapsed if elapsed > 0 else 0
+                        print(f"\r  Indexed {count:,} files ({rate:,.0f}/s)...", end="", flush=True)
+                        files_batch = []
+
+            # Final batch
+            if files_batch:
+                self.conn.executemany(
+                    "INSERT OR REPLACE INTO files(path, name, ext, size, mtime, is_dir) VALUES(?,?,?,?,?,?)",
+                    files_batch
+                )
+                self.conn.commit()
+
+            elapsed = time.time() - t0
+            print(f"\r  ✅ Indexed {count:,} files in {elapsed:.1f}s ({count/elapsed:,.0f}/s)")
+            self.last_indexed = time.time()
+
+    def search(self, query, limit=100, ext=None, dir_only=False):
+        """Instant filename search using FTS5."""
+        with self._lock:
+            # Handle wildcards properly
+            fts_query = query
+            
+            # *.ext → suffix match
+            if fts_query.startswith('*.'):
+                suffix = fts_query[1:]  # .pptx
+                sql = f"""
+                    SELECT f.path, f.name, f.ext, f.size, f.mtime, f.is_dir, 0 as rank
+                    FROM files f
+                    WHERE f.ext = ? AND {'f.is_dir = 1' if dir_only else '1=1'}
+                    ORDER BY f.mtime DESC
+                    LIMIT ?
+                """
+                params = [suffix, limit]
+                t0 = time.time()
+                rows = self.conn.execute(sql, params).fetchall()
+                elapsed = (time.time() - t0) * 1000
+                return rows, elapsed
+            
+            # Replace ? with _ for FTS5 single-char wildcard
+            fts_query = fts_query.replace('?', '_')
+            if '*' not in fts_query:
+                fts_query = f'"{fts_query}"*'  # prefix match
+            
+            conditions = []
+            params = []
+            
+            if ext:
+                conditions.append("f.ext = ?")
+                params.append(ext.lower())
+            if dir_only:
+                conditions.append("f.is_dir = 1")
+            
+            where = " AND ".join(conditions) if conditions else "1=1"
+            
+            sql = f"""
+                SELECT f.path, f.name, f.ext, f.size, f.mtime, f.is_dir,
+                       rank
+                FROM files_fts 
+                JOIN files f ON files_fts.rowid = f.id
+                WHERE files_fts MATCH ? AND {where}
+                ORDER BY rank
+                LIMIT ?
+            """
+            params = [fts_query] + params + [limit]
+            
+            t0 = time.time()
+            rows = self.conn.execute(sql, params).fetchall()
+            elapsed = (time.time() - t0) * 1000
+            
+            return rows, elapsed
+
+    def stats(self):
+        count = self.conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+        db_size = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+        return count, db_size
+
+    def add_file(self, path):
+        """Add or update a single file in the index."""
+        if self.should_ignore(path):
+            return
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return
+        name = os.path.basename(path)
+        _, ext = os.path.splitext(path)
+        is_dir = 1 if os.path.isdir(path) else 0
+        size = st.st_size if not is_dir else 0
+        with self._lock:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO files(path, name, ext, size, mtime, is_dir) VALUES(?,?,?,?,?,?)",
+                (path, name, ext.lower(), size, st.st_mtime, is_dir))
+            self.conn.commit()
+
+    def remove_file(self, path):
+        """Remove a file from the index."""
+        with self._lock:
+            self.conn.execute("DELETE FROM files WHERE path = ?", (path,))
+            self.conn.commit()
+
+    def rename_file(self, old, new):
+        """Handle file rename/move."""
+        self.remove_file(old)
+        self.add_file(new)
+
+
+
+    def close(self):
+        self.conn.close()
+
+
+def format_size(size):
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if abs(size) < 1024:
+            return f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{size:.1f}PB"
+
+def format_time(ts):
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="mac-everything — Instant file search for macOS (like voidtools Everything)")
+    sub = parser.add_subparsers(dest="cmd")
+    
+    # Index
+    idx = sub.add_parser("index", help="Build/rebuild file index")
+    idx.add_argument("paths", nargs="*", default=["/Users"], help="Paths to index (default: /Users)")
+    
+    # Search
+    srch = sub.add_parser("search", help="Search files instantly (auto-syncs index)")
+    srch.add_argument("query", help="Search query (supports * and ? wildcards)")
+    srch.add_argument("-n", "--limit", type=int, default=50, help="Max results")
+    srch.add_argument("-e", "--ext", help="Filter by extension (e.g. py, pdf)")
+    srch.add_argument("-d", "--dir", action="store_true", help="Directories only")
+    srch.add_argument("--no-sync", action="store_true", help="Skip auto index update")
+    
+    # Update
+    upd = sub.add_parser("update", help="Incremental index update (only changed files)")
+    upd.add_argument("paths", nargs="*", default=["/Users"], help="Paths to update (default: /Users)")
+    
+    # Stats
+    sub.add_parser("stats", help="Show index statistics")
+    
+    args = parser.parse_args()
+    me = MacEverything()
+    
+    try:
+        if args.cmd == "index":
+            paths = args.paths if args.paths else ["/Users"]
+            print(f"🔍 Indexing: {', '.join(paths)}")
+            me.index_path(paths)
+            count, db_size = me.stats()
+            print(f"📊 Database: {count:,} files, {format_size(db_size)}")
+            
+        elif args.cmd == "search":
+            if not args.no_sync:
+                me.quick_sync()
+            rows, ms = me.search(args.query, args.limit, args.ext, args.dir)
+            print(f"🔎 '{args.query}' — {len(rows)} results ({ms:.1f}ms)")
+            print()
+            for path, name, ext, size, mtime, is_dir, rank in rows:
+                icon = "📁" if is_dir else "📄"
+                print(f"  {icon} {path}")
+                if size:
+                    print(f"     {format_size(size)}  {format_time(mtime)}")
+        elif args.cmd == "update":
+            paths = args.paths if args.paths else ["/Users"]
+            added, removed = me.quick_sync(paths)
+            count, db_size = me.stats()
+            print(f"📊 Database: {count:,} files, {format_size(db_size)}")
+        elif args.cmd == "stats":
+            count, db_size = me.stats()
+            print(f"📊 mac-everything Index")
+            print(f"   Files: {count:,}")
+            print(f"   Database: {format_size(db_size)} ({DB_PATH})")
+            print(f"   Last indexed: {datetime.fromtimestamp(me.last_indexed).strftime('%Y-%m-%d %H:%M:%S')}")
+        else:
+            parser.print_help()
+    finally:
+        me.close()
+
+if __name__ == "__main__":
+    main()
