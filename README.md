@@ -1,4 +1,4 @@
-# mac-everything v2.0
+# mac-everything v3.0
 
 macOS 版 Everything 文件搜索——SQLite FTS5 即时文件名搜索。
 
@@ -13,7 +13,7 @@ mac-everything (CLI引擎)  →  mac-everything-gui (HTTP服务 :8765)  →  浏
 ## 安装
 
 可直接在右边releases下载mac-everything.dmg，或复制以下地址
-(https://github.com/sunnybluesea/mac-everything/releases/download/v2.0/mac-everything.dmg.zip)
+(https://github.com/sunnybluesea/mac-everything/releases/download/v3.0/mac-everything.dmg.zip)
 
 ```bash
 # 1. 拷贝脚本
@@ -73,6 +73,10 @@ open http://127.0.0.1:8765
 | 数据库锁定崩溃 | 启用 `busy_timeout=30s`，消除启动时 launchd 竞态 |
 | GLOB 路径注入 | 改用 `LIKE ... ESCAPE '\'`，路径含 `[` `]` `*` `?` 也安全 |
 | 隐藏文件占满结果 | 服务端过滤隐藏文件，500 条结果全部可见 |
+
+## v3.0 更新
+
+- **FTS5 列限定搜索**：搜索只匹配文件名（`name` 列），不再匹配路径（`path` 列）。修复了搜 `ppt` 会把 `1-page-ppt/` 文件夹下所有文件都返回的问题
 
 ## Author
 

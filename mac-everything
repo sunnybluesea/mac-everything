@@ -341,7 +341,8 @@ class MacEverything:
                     tokenized = f'"{tokenized}"*'  # prefix match
                 elif '"' not in term:
                     tokenized = f'"{tokenized}"'
-                fts_terms.append(tokenized)
+                # Column-filtered: only search name, not path
+                fts_terms.append(f'name : {tokenized}')
 
             fts_query = ' AND '.join(fts_terms)
 
