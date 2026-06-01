@@ -25,14 +25,12 @@ def get_engine():
     with engine_lock:
         if engine is None:
             engine = me_module.MacEverything()
-            # Warm up: quick sync on startup
-            while True:
-                now=time.time()
-                try:
-                    engine.quick_sync()
-                except NameError:
-                    break
-                break
+            count, _ = engine.stats()
+            if count == 0:
+                print("   First run — building full index (this may take a few minutes)...")
+                engine.index_path()
+            else:
+                engine.quick_sync()
         return engine
 
 # ── HTML UI ────────────────────────────────────────────────────
@@ -139,6 +137,40 @@ body {
 .filter:hover { background: var(--border); color: var(--text); }
 .filter.active { background: var(--accent-dim); color: var(--accent); border-color: var(--accent); }
 
+/* ── Hidden files toggle ── */
+.hidden-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-dim);
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+  user-select: none;
+}
+.hidden-toggle .switch {
+  position: relative;
+  width: 32px;
+  height: 18px;
+  background: var(--border);
+  border-radius: 9px;
+  transition: background 0.2s;
+}
+.hidden-toggle .switch.on { background: var(--accent); }
+.hidden-toggle .switch::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  background: var(--text);
+  border-radius: 50%;
+  transition: transform 0.2s;
+}
+.hidden-toggle .switch.on::after { transform: translateX(14px); }
+
 /* ── Results Table ── */
 .results-wrap {
   flex: 1;
@@ -213,7 +245,7 @@ body {
 <!-- Title Bar -->
 <div class="titlebar">
   <span class="titlebar-icon">🔍</span>
-  <span class="titlebar-text">mac-everything</span>
+  <span class="titlebar-text">mac-everything <span id="db-time" style="font-size:10px;color:var(--text-dim)"></span></span>
   <span class="titlebar-count" id="count"></span>
 </div>
 
@@ -230,6 +262,10 @@ body {
     <span class="filter" data-type="img">图片</span>
     <span class="filter" data-type="code">代码</span>
     <span class="filter" data-type="dir">文件夹</span>
+    <span class="hidden-toggle" id="hidden-toggle" onclick="toggleHidden()">
+      <span class="switch" id="hidden-switch"></span>
+      <span>隐藏文件</span>
+    </span>
   </div>
 </div>
 
@@ -265,6 +301,7 @@ body {
 let selectedIdx = -1;
 let currentResults = [];
 let currentFilter = 'all';
+let showHidden = false;
 
 const searchEl = document.getElementById('search');
 const tbody = document.getElementById('results-body');
@@ -324,7 +361,7 @@ async function search(q) {
   try {
     const ext = currentFilter === 'all' ? '' : '';
     const dirOnly = currentFilter === 'dir';
-    let url = `/api/search?q=${encodeURIComponent(q)}&limit=200`;
+    let url = `/api/search?q=${encodeURIComponent(q)}&limit=500&hidden=${showHidden ? 1 : 0}`;
     if (dirOnly) url += '&dir=1';
 
     const resp = await fetch(url);
@@ -340,6 +377,9 @@ async function search(q) {
     else if (currentFilter === 'img') filtered = currentResults.filter(r => IMG_EXTS.includes((r[2]||'').replace('.','').toLowerCase()));
     else if (currentFilter === 'code') filtered = currentResults.filter(r => CODE_EXTS.includes((r[2]||'').replace('.','').toLowerCase()));
     else if (currentFilter === 'dir') filtered = currentResults.filter(r => r[5] === 1);
+
+    // Filter hidden files — exclude paths that contain a .-prefixed component
+    if (!showHidden) filtered = filtered.filter(r => !r[0].split('/').some(p => p.startsWith('.')));
 
     renderResults(filtered, elapsed);
     statusTime.textContent = elapsed + 'ms';
@@ -486,17 +526,34 @@ document.querySelectorAll('.filter').forEach(f => {
   });
 });
 
+function toggleHidden() {
+  showHidden = !showHidden;
+  document.getElementById('hidden-switch').classList.toggle('on', showHidden);
+  // Re-search to get server-side hidden filtering
+  if (searchEl.value.trim()) {
+    search(searchEl.value);
+  }
+}
+
 // ── Init ──
 searchEl.focus();
 statusText.textContent = '⏳ 连接服务器中...';
 
 // Poll until server is ready (may take a few seconds on first launch)
 let pollCount = 0;
+function updateDbTime(ts) {
+  if (!ts) return;
+  const d = new Date(ts * 1000);
+  const pad = n => String(n).padStart(2, '0');
+  document.getElementById('db-time').textContent =
+    `(数据库更新: ${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())})`;
+}
 function checkReady() {
   fetch('/api/stats')
     .then(r => r.json())
     .then(d => {
       statusText.textContent = `就绪 · ${d.files.toLocaleString()} 个文件已索引`;
+      updateDbTime(d.last_indexed);
       searchEl.focus();
     })
     .catch(() => {
@@ -506,6 +563,10 @@ function checkReady() {
     });
 }
 checkReady();
+// Refresh DB time every 5 minutes
+setInterval(() => {
+  fetch('/api/stats').then(r => r.json()).then(d => updateDbTime(d.last_indexed)).catch(() => {});
+}, 300000);
 </script>
 </body>
 </html>"""
@@ -522,12 +583,13 @@ class SearchHandler(SimpleHTTPRequestHandler):
         if parsed.path == '/api/search':
             params = parse_qs(parsed.query)
             q = params.get('q', [''])[0]
-            limit = int(params.get('limit', ['200'])[0])
+            limit = int(params.get('limit', ['500'])[0])
             dir_only = 'dir' in params
+            exclude_hidden = params.get('hidden', ['1'])[0] == '0'
 
             try:
                 eng = get_engine()
-                rows, ms = eng.search(q, limit=limit, dir_only=dir_only)
+                rows, ms = eng.search(q, limit=limit, dir_only=dir_only, exclude_hidden=exclude_hidden)
                 results = [list(r) for r in rows]
                 resp = json.dumps({'results': results, 'ms': ms, 'query': q}, ensure_ascii=False).encode()
             except Exception as e:
@@ -608,15 +670,19 @@ def main():
     count, db_size = eng.stats()
     print(f"   Index: {count:,} files, {me_module.format_size(db_size)}")
 
+    # Start background periodic sync (every hour)
+    fsevent = me_module.FSEventMonitor(eng)
+    fsevent.start()
+    print("   🔄 Background sync every 1h")
+
     # Try to start server; if port taken, just open browser to existing instance
     try:
         server = HTTPServer(('127.0.0.1', args.port), SearchHandler)
     except OSError:
-        # Already running — open browser to existing instance and stay alive
         print(f"   Already running on port {args.port}, opening browser...")
+        fsevent.stop()
         if not args.no_browser:
             webbrowser.open(f'http://127.0.0.1:{args.port}')
-        # Stay alive so macOS doesn't think the app crashed
         import signal
         signal.pause()
         return
@@ -631,6 +697,7 @@ def main():
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n👋 Shutting down...")
+        fsevent.stop()
         server.shutdown()
 
 if __name__ == '__main__':
